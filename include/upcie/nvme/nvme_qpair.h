@@ -224,19 +224,28 @@ nvme_qpair_submit_sync(struct nvme_qpair *qp, struct nvme_command *cmd, int time
 
 	err = nvme_qpair_enqueue(qp, cmd);
 	if (err) {
-		return -err;
+		/* Never reached the controller, so the cid is safe to hand back. */
+		nvme_request_free(qp->rpool, req->cid);
+		return err;
 	}
 
 	nvme_qpair_sqdb_update(qp);
 
 	err = nvme_qpair_reap_cpl(qp, timeout_ms, cpl);
 	if (err) {
-		return -err;
+		/* The command is still in flight; the controller may yet complete it.
+		 * Handing the cid back would let a later command reuse it and match
+		 * that stale completion, so it is retired instead. */
+		return err;
 	}
 
 	nvme_request_free(qp->rpool, req->cid);
 
-	if (cpl->status & 0x1FE) {
+	/* SC (bits 1-8) and SCT (bits 9-11); bit 0 is the phase tag. Masking SC
+	 * alone reads a non-generic status with SC == 0 as success -- SCT=1/SC=0x0,
+	 * "Completion Queue Invalid", is one Create I/O SQ can return. */
+	if ((cpl->status >> 1) & 0x7FF) {
+		UPCIE_DEBUG("FAILED: CQE status(0x%x)", cpl->status);
 		err = -EIO;
 	}
 
@@ -279,19 +288,28 @@ nvme_qpair_submit_sync_contig_prps(struct nvme_qpair *qp, struct hostmem_heap *h
 
 	err = nvme_qpair_enqueue(qp, cmd);
 	if (err) {
-		return -err;
+		/* Never reached the controller, so the cid is safe to hand back. */
+		nvme_request_free(qp->rpool, req->cid);
+		return err;
 	}
 
 	nvme_qpair_sqdb_update(qp);
 
 	err = nvme_qpair_reap_cpl(qp, timeout_ms, cpl);
 	if (err) {
-		return -err;
+		/* The command is still in flight; the controller may yet complete it.
+		 * Handing the cid back would let a later command reuse it and match
+		 * that stale completion, so it is retired instead. */
+		return err;
 	}
 
 	nvme_request_free(qp->rpool, req->cid);
 
-	if (cpl->status & 0x1FE) {
+	/* SC (bits 1-8) and SCT (bits 9-11); bit 0 is the phase tag. Masking SC
+	 * alone reads a non-generic status with SC == 0 as success -- SCT=1/SC=0x0,
+	 * "Completion Queue Invalid", is one Create I/O SQ can return. */
+	if ((cpl->status >> 1) & 0x7FF) {
+		UPCIE_DEBUG("FAILED: CQE status(0x%x)", cpl->status);
 		err = -EIO;
 	}
 
@@ -334,19 +352,28 @@ nvme_qpair_submit_sync_iov_prps(struct nvme_qpair *qp, struct hostmem_heap *heap
 
 	err = nvme_qpair_enqueue(qp, cmd);
 	if (err) {
-		return -err;
+		/* Never reached the controller, so the cid is safe to hand back. */
+		nvme_request_free(qp->rpool, req->cid);
+		return err;
 	}
 
 	nvme_qpair_sqdb_update(qp);
 
 	err = nvme_qpair_reap_cpl(qp, timeout_ms, cpl);
 	if (err) {
-		return -err;
+		/* The command is still in flight; the controller may yet complete it.
+		 * Handing the cid back would let a later command reuse it and match
+		 * that stale completion, so it is retired instead. */
+		return err;
 	}
 
 	nvme_request_free(qp->rpool, req->cid);
 
-	if (cpl->status & 0x1FE) {
+	/* SC (bits 1-8) and SCT (bits 9-11); bit 0 is the phase tag. Masking SC
+	 * alone reads a non-generic status with SC == 0 as success -- SCT=1/SC=0x0,
+	 * "Completion Queue Invalid", is one Create I/O SQ can return. */
+	if ((cpl->status >> 1) & 0x7FF) {
+		UPCIE_DEBUG("FAILED: CQE status(0x%x)", cpl->status);
 		err = -EIO;
 	}
 

@@ -45,28 +45,9 @@ nvme_controller_cuda_delete_io_qpair(struct nvme_controller *ctrlr,
 		UPCIE_DEBUG("FAILED: cuMemHostUnregister(cqdb); CUresult(%d)", err);
 	}
 	
-	{
-		struct nvme_command cmd;
-		struct nvme_completion cpl = {0};
-
-		nvme_command_delete_io_sq(&cmd, _qpair.qid);
-
-		err = nvme_qpair_submit_sync(&ctrlr->aq, &cmd, ctrlr->timeout_ms, &cpl);
-		if (err) {
-			UPCIE_DEBUG("FAILED: nvme_qpair_submit_sync(Delete SQ); err(%d)", err);
-		}
-	}
-
-	{
-		struct nvme_command cmd;
-		struct nvme_completion cpl = {0};
-
-		nvme_command_delete_io_cq(&cmd, _qpair.qid);
-
-		err = nvme_qpair_submit_sync(&ctrlr->aq, &cmd, ctrlr->timeout_ms, &cpl);
-		if (err) {
-			UPCIE_DEBUG("FAILED: nvme_qpair_submit_sync(Delete CQ); err(%d)", err);
-		}
+	err = nvme_controller_unprogram_io_qpair(ctrlr, _qpair.qid);
+	if (err) {
+		UPCIE_DEBUG("FAILED: nvme_controller_unprogram_io_qpair(); err(%d)", err);
 	}
 
 	cudamem_heap_block_free(heap, _qpair.sq);
@@ -107,7 +88,6 @@ nvme_controller_cuda_create_io_qpair(struct nvme_controller *ctrlr,
 	uint64_t sq_iova, cq_iova;
 	uint16_t qid;
 	int qid_orphaned = 0;
-	int del_err;
 	int err;
 
 	/* An unrelated dmamem resolves the queues to a plausible-looking address
@@ -209,48 +189,13 @@ nvme_controller_cuda_create_io_qpair(struct nvme_controller *ctrlr,
 		}
 	}
 
-	{
-		struct nvme_command cmd;
-		struct nvme_completion cpl = {0};
-
-		nvme_command_create_io_cq(&cmd, qid, depth, cq_iova);
-
-		err = nvme_qpair_submit_sync(&ctrlr->aq, &cmd, ctrlr->timeout_ms, &cpl);
-		if (err) {
-			UPCIE_DEBUG("FAILED: nvme_qpair_submit_sync(Create CQ); err(%d)", err);
-			goto free_cq;
-		}
-	}
-
-	{
-		struct nvme_command cmd;
-		struct nvme_completion cpl = {0};
-
-		nvme_command_create_io_sq(&cmd, qid, depth, sq_iova);
-
-		err = nvme_qpair_submit_sync(&ctrlr->aq, &cmd, ctrlr->timeout_ms, &cpl);
-		if (err) {
-			UPCIE_DEBUG("FAILED: nvme_qpair_submit_sync(Create SQ); err(%d)", err);
-			goto delete_cq;
-		}
+	err = nvme_controller_program_io_qpair(ctrlr, qid, depth, sq_iova, cq_iova, &qid_orphaned);
+	if (err) {
+		goto free_cq;
 	}
 
 	return 0;
 
-delete_cq:
-	/* Kept out of err, which carries the failure being unwound. */
-	del_err = nvme_controller_delete_io_cq(ctrlr, qid);
-	if (del_err) {
-		UPCIE_DEBUG("FAILED: nvme_controller_delete_io_cq(); err(%d)", del_err);
-
-		/* The controller still holds a completion queue under this qid, so the
-		 * qid is retired instead of returned to the pool: handing it out again
-		 * would collide with that queue on the next Create I/O CQ. The queue
-		 * memory and the doorbell registrations are still released, since no
-		 * submission queue was bound to the completion queue and nothing can
-		 * post into it. */
-		qid_orphaned = 1;
-	}
 free_cq:
 	cudamem_heap_block_free(heap, _qpair.cq);
 free_sq:

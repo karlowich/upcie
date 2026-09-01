@@ -164,10 +164,9 @@ nvme_controller_create_io_qpair_dmamem(struct nvme_controller *ctrlr, struct nvm
 				       size_t *sq_offset_out, size_t *cq_offset_out,
 				       size_t *prp_offset_out)
 {
-	struct nvme_command cmd = {0};
-	struct nvme_completion cpl = {0};
 	uint64_t sq_iova = 0, cq_iova = 0;
 	uint16_t qid;
+	int qid_orphaned = 0;
 	int err;
 
 	err = nvme_qid_find_free(ctrlr->qids);
@@ -190,23 +189,8 @@ nvme_controller_create_io_qpair_dmamem(struct nvme_controller *ctrlr, struct nvm
 		return err;
 	}
 
-	nvme_command_create_io_cq(&cmd, qid, depth, cq_iova);
-	err = nvme_qpair_submit_sync(&ctrlr->aq, &cmd, ctrlr->timeout_ms, &cpl);
+	err = nvme_controller_program_io_qpair(ctrlr, qid, depth, sq_iova, cq_iova, &qid_orphaned);
 	if (err) {
-		UPCIE_DEBUG("FAILED: CREATE_IO_CQ(qid=%u); err(%d)", qid, err);
-		goto rollback_qpair;
-	}
-
-	memset(&cpl, 0, sizeof(cpl));
-	nvme_command_create_io_sq(&cmd, qid, depth, sq_iova);
-	err = nvme_qpair_submit_sync(&ctrlr->aq, &cmd, ctrlr->timeout_ms, &cpl);
-	if (err) {
-		struct nvme_command drop;
-		struct nvme_completion drop_cpl = {0};
-
-		UPCIE_DEBUG("FAILED: CREATE_IO_SQ(qid=%u); err(%d)", qid, err);
-		nvme_command_delete_io_cq(&drop, qid);
-		(void)nvme_qpair_submit_sync(&ctrlr->aq, &drop, ctrlr->timeout_ms, &drop_cpl);
 		goto rollback_qpair;
 	}
 
@@ -214,7 +198,9 @@ nvme_controller_create_io_qpair_dmamem(struct nvme_controller *ctrlr, struct nvm
 
 rollback_qpair:
 	nvme_qpair_dmamem_term(qp, heap, *sq_offset_out, *cq_offset_out, *prp_offset_out);
-	nvme_qid_free(ctrlr->qids, qid);
+	if (!qid_orphaned) {
+		nvme_qid_free(ctrlr->qids, qid);
+	}
 	return err;
 }
 
@@ -226,24 +212,10 @@ nvme_controller_delete_io_qpair_dmamem(struct nvme_controller *ctrlr, struct nvm
 				       struct dmamem_heap *heap, size_t sq_offset, size_t cq_offset,
 				       size_t prp_offset)
 {
-	struct nvme_command cmd = {0};
-	struct nvme_completion cpl = {0};
 	uint16_t qid = qp->qid;
-	int first_err = 0;
-	int err;
+	int first_err;
 
-	nvme_command_delete_io_sq(&cmd, qid);
-	err = nvme_qpair_submit_sync(&ctrlr->aq, &cmd, ctrlr->timeout_ms, &cpl);
-	if (err && !first_err) {
-		first_err = err;
-	}
-
-	memset(&cpl, 0, sizeof(cpl));
-	nvme_command_delete_io_cq(&cmd, qid);
-	err = nvme_qpair_submit_sync(&ctrlr->aq, &cmd, ctrlr->timeout_ms, &cpl);
-	if (err && !first_err) {
-		first_err = err;
-	}
+	first_err = nvme_controller_unprogram_io_qpair(ctrlr, qid);
 
 	nvme_qpair_dmamem_term(qp, heap, sq_offset, cq_offset, prp_offset);
 	nvme_qid_free(ctrlr->qids, qid);

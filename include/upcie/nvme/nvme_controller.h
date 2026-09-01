@@ -147,6 +147,117 @@ nvme_controller_delete_io_cq(struct nvme_controller *ctrlr, uint16_t qid)
 }
 
 /**
+ * Tell the controller about an already-allocated I/O queue pair.
+ *
+ * Sends Create I/O CQ then Create I/O SQ, which is the required order: the
+ * submission queue names the completion queue it reports into, and a controller
+ * asked for it the other way round answers SCT=1/SC=0x0, "Completion Queue
+ * Invalid". If the submission queue is refused, the completion queue this call
+ * created is deleted again, so a failure leaves the controller as it was found.
+ *
+ * The queue memory is the caller's: this programs the addresses and nothing
+ * else, which is what lets one implementation serve the hostmem, dmamem and GPU
+ * backings. `sq_addr` and `cq_addr` are the addresses as the controller sees
+ * them -- an IOVA where a mapping was installed, a physical address where none
+ * was.
+ *
+ * Should that rollback fail too, the controller is left holding a completion
+ * queue under `qid` and `*qid_orphaned` is set. The caller reserved the qid, so
+ * only the caller can retire it, and retire it it must: handing the same qid out
+ * again collides with the queue the controller still has. Freeing the queue
+ * memory stays safe either way, since no submission queue was ever bound to that
+ * completion queue and nothing can post into it.
+ *
+ * @param ctrlr         Pointer to a pre-allocated NVMe controller
+ * @param qid           Identifier for the pair; already reserved by the caller
+ * @param depth         Queue depth in entries
+ * @param sq_addr       Address of the submission queue
+ * @param cq_addr       Address of the completion queue
+ * @param qid_orphaned  Set to 1 when the controller kept a completion queue
+ *                      under `qid`; left untouched otherwise
+ *
+ * @return 0 on success, negative errno on error.
+ */
+static inline int
+nvme_controller_program_io_qpair(struct nvme_controller *ctrlr, uint16_t qid, uint16_t depth,
+				 uint64_t sq_addr, uint64_t cq_addr, int *qid_orphaned)
+{
+	struct nvme_command cmd;
+	struct nvme_completion cpl = {0};
+	int err;
+
+	nvme_command_create_io_cq(&cmd, qid, depth, cq_addr);
+	err = nvme_qpair_submit_sync(&ctrlr->aq, &cmd, ctrlr->timeout_ms, &cpl);
+	if (err) {
+		UPCIE_DEBUG("FAILED: Create I/O CQ(qid=%u); err(%d)", qid, err);
+		return err;
+	}
+
+	memset(&cpl, 0, sizeof(cpl));
+	nvme_command_create_io_sq(&cmd, qid, depth, sq_addr);
+	err = nvme_qpair_submit_sync(&ctrlr->aq, &cmd, ctrlr->timeout_ms, &cpl);
+	if (err) {
+		int del_err;
+
+		UPCIE_DEBUG("FAILED: Create I/O SQ(qid=%u); err(%d)", qid, err);
+
+		/* Kept out of err, which carries the failure being unwound. */
+		del_err = nvme_controller_delete_io_cq(ctrlr, qid);
+		if (del_err) {
+			UPCIE_DEBUG("FAILED: nvme_controller_delete_io_cq(); err(%d)", del_err);
+			*qid_orphaned = 1;
+		}
+
+		return err;
+	}
+
+	return 0;
+}
+
+/**
+ * Tell the controller to forget an I/O queue pair.
+ *
+ * Sends Delete I/O SQ then Delete I/O CQ, the required order: a completion
+ * queue still bound to a submission queue cannot be deleted. Both are attempted
+ * even if the first fails, so the controller is left as clean as it can be, and
+ * the first error is what comes back.
+ *
+ * The queue memory is the caller's and is not touched here.
+ *
+ * @param ctrlr Pointer to a pre-allocated NVMe controller
+ * @param qid   Identifier of the pair to delete
+ *
+ * @return 0 on success, negative errno of the first failure otherwise.
+ */
+static inline int
+nvme_controller_unprogram_io_qpair(struct nvme_controller *ctrlr, uint16_t qid)
+{
+	struct nvme_command cmd;
+	struct nvme_completion cpl = {0};
+	int first_err = 0;
+	int err;
+
+	nvme_command_delete_io_sq(&cmd, qid);
+	err = nvme_qpair_submit_sync(&ctrlr->aq, &cmd, ctrlr->timeout_ms, &cpl);
+	if (err) {
+		UPCIE_DEBUG("FAILED: Delete I/O SQ(qid=%u); err(%d)", qid, err);
+		first_err = err;
+	}
+
+	memset(&cpl, 0, sizeof(cpl));
+	nvme_command_delete_io_cq(&cmd, qid);
+	err = nvme_qpair_submit_sync(&ctrlr->aq, &cmd, ctrlr->timeout_ms, &cpl);
+	if (err) {
+		UPCIE_DEBUG("FAILED: Delete I/O CQ(qid=%u); err(%d)", qid, err);
+		if (!first_err) {
+			first_err = err;
+		}
+	}
+
+	return first_err;
+}
+
+/**
  * Deletes the submission-queue and completion-queue and frees host-side resources.
  *
  * Sends Delete I/O SQ and Delete I/O CQ admin commands to the controller, then
@@ -163,29 +274,7 @@ nvme_controller_delete_io_qpair(struct nvme_controller *ctrlr, struct nvme_qpair
 	uint16_t qid = qpair->qid;
 	int err;
 
-	{
-		struct nvme_command cmd;
-		struct nvme_completion cpl = {0};
-
-		nvme_command_delete_io_sq(&cmd, qid);
-
-		err = nvme_qpair_submit_sync(&ctrlr->aq, &cmd, ctrlr->timeout_ms, &cpl);
-		if (err) {
-			UPCIE_DEBUG("FAILED: nvme_qpair_submit_sync(Delete SQ); err(%d)", err);
-		}
-	}
-
-	{
-		struct nvme_command cmd;
-		struct nvme_completion cpl = {0};
-
-		nvme_command_delete_io_cq(&cmd, qid);
-
-		err = nvme_qpair_submit_sync(&ctrlr->aq, &cmd, ctrlr->timeout_ms, &cpl);
-		if (err) {
-			UPCIE_DEBUG("FAILED: nvme_qpair_submit_sync(Delete CQ); err(%d)", err);
-		}
-	}
+	err = nvme_controller_unprogram_io_qpair(ctrlr, qid);
 
 	nvme_qpair_term(qpair);
 	nvme_qid_free(ctrlr->qids, qid);
@@ -202,7 +291,6 @@ nvme_controller_create_io_qpair(struct nvme_controller *ctrlr, struct nvme_qpair
 {
 	uint16_t qid;
 	int qid_orphaned = 0;
-	int del_err;
 	int err;
 
 	err = nvme_qid_find_free(ctrlr->qids);
@@ -223,49 +311,16 @@ nvme_controller_create_io_qpair(struct nvme_controller *ctrlr, struct nvme_qpair
 		goto free_qid;
 	}
 
-	{
-		struct nvme_command cmd;
-		struct nvme_completion cpl = {0};
-
-		nvme_command_create_io_cq(&cmd, qid, depth,
-					  hostmem_dma_v2p(ctrlr->heap, qpair->cq));
-
-		err = nvme_qpair_submit_sync(&ctrlr->aq, &cmd, ctrlr->timeout_ms, &cpl);
-		if (err) {
-			UPCIE_DEBUG("FAILED: nvme_qpair_submit_sync(Create CQ); err(%d)", err);
-			goto term_qpair;
-		}
-	}
-
-	{
-		struct nvme_command cmd;
-		struct nvme_completion cpl = {0};
-
-		nvme_command_create_io_sq(&cmd, qid, depth,
-					  hostmem_dma_v2p(ctrlr->heap, qpair->sq));
-
-		err = nvme_qpair_submit_sync(&ctrlr->aq, &cmd, ctrlr->timeout_ms, &cpl);
-		if (err) {
-			UPCIE_DEBUG("FAILED: nvme_qpair_submit_sync(Create SQ); err(%d)", err);
-			goto delete_cq;
-		}
+	err = nvme_controller_program_io_qpair(ctrlr, qid, depth,
+					       hostmem_dma_v2p(ctrlr->heap, qpair->sq),
+					       hostmem_dma_v2p(ctrlr->heap, qpair->cq),
+					       &qid_orphaned);
+	if (err) {
+		goto term_qpair;
 	}
 
 	return 0;
 
-delete_cq:
-	/* Kept out of err, which carries the failure being unwound. */
-	del_err = nvme_controller_delete_io_cq(ctrlr, qid);
-	if (del_err) {
-		UPCIE_DEBUG("FAILED: nvme_controller_delete_io_cq(); err(%d)", del_err);
-
-		/* The controller still holds a completion queue under this qid, so the
-		 * qid is retired instead of returned to the pool: handing it out again
-		 * would collide with that queue on the next Create I/O CQ. The queue
-		 * memory is still released, since no submission queue was bound to the
-		 * completion queue and nothing can post into it. */
-		qid_orphaned = 1;
-	}
 term_qpair:
 	nvme_qpair_term(qpair);
 	memset(qpair, 0, sizeof(*qpair));

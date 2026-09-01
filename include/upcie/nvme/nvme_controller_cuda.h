@@ -46,11 +46,10 @@ nvme_controller_cuda_delete_io_qpair(struct nvme_controller *ctrlr,
 	}
 	
 	{
-		struct nvme_command cmd = {0};
+		struct nvme_command cmd;
 		struct nvme_completion cpl = {0};
 
-		cmd.opc = 0x0; ///< Delete I/O Submission Queue
-		cmd.cdw10 = _qpair.qid;
+		nvme_command_delete_io_sq(&cmd, _qpair.qid);
 
 		err = nvme_qpair_submit_sync(&ctrlr->aq, &cmd, ctrlr->timeout_ms, &cpl);
 		if (err) {
@@ -59,11 +58,10 @@ nvme_controller_cuda_delete_io_qpair(struct nvme_controller *ctrlr,
 	}
 
 	{
-		struct nvme_command cmd = {0};
+		struct nvme_command cmd;
 		struct nvme_completion cpl = {0};
 
-		cmd.opc = 0x4; ///< Delete I/O completion Queue
-		cmd.cdw10 = _qpair.qid;
+		nvme_command_delete_io_cq(&cmd, _qpair.qid);
 
 		err = nvme_qpair_submit_sync(&ctrlr->aq, &cmd, ctrlr->timeout_ms, &cpl);
 		if (err) {
@@ -212,13 +210,10 @@ nvme_controller_cuda_create_io_qpair(struct nvme_controller *ctrlr,
 	}
 
 	{
-		struct nvme_command cmd = {0};
+		struct nvme_command cmd;
 		struct nvme_completion cpl = {0};
 
-		cmd.opc = 0x5; ///< Create I/O Completion Queue
-		cmd.prp1 = cq_iova;
-		cmd.cdw10 = ((depth - 1) << 16) | qid;
-		cmd.cdw11 = 0x1; ///< Physically contigous
+		nvme_command_create_io_cq(&cmd, qid, depth, cq_iova);
 
 		err = nvme_qpair_submit_sync(&ctrlr->aq, &cmd, ctrlr->timeout_ms, &cpl);
 		if (err) {
@@ -228,13 +223,10 @@ nvme_controller_cuda_create_io_qpair(struct nvme_controller *ctrlr,
 	}
 
 	{
-		struct nvme_command cmd = {0};
+		struct nvme_command cmd;
 		struct nvme_completion cpl = {0};
 
-		cmd.opc = 0x1; ///< Create I/O Submission Queue
-		cmd.prp1 = sq_iova;
-		cmd.cdw10 = ((depth - 1) << 16) | qid;
-		cmd.cdw11 = (qid << 16) | 0x1; ///< CQID and Physically contigous
+		nvme_command_create_io_sq(&cmd, qid, depth, sq_iova);
 
 		err = nvme_qpair_submit_sync(&ctrlr->aq, &cmd, ctrlr->timeout_ms, &cpl);
 		if (err) {

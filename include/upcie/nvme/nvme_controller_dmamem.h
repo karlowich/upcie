@@ -223,31 +223,22 @@ nvme_controller_create_io_qpair_dmamem(struct nvme_controller *ctrlr, struct nvm
 		return err;
 	}
 
-	memset(&cmd, 0, sizeof(cmd));
-	cmd.opc = 0x5; /* Create I/O Completion Queue */
-	cmd.prp1 = cq_iova;
-	cmd.cdw10 = ((uint32_t)(depth - 1) << 16) | qid;
-	cmd.cdw11 = 0x1; /* Physically contiguous, no interrupts */
+	nvme_command_create_io_cq(&cmd, qid, depth, cq_iova);
 	err = nvme_admin_sync_dmamem(ctrlr, &cmd, 2, &cpl);
 	if (err) {
 		UPCIE_DEBUG("FAILED: CREATE_IO_CQ(qid=%u); err(%d)", qid, err);
 		goto rollback_qpair;
 	}
 
-	memset(&cmd, 0, sizeof(cmd));
 	memset(&cpl, 0, sizeof(cpl));
-	cmd.opc = 0x1; /* Create I/O Submission Queue */
-	cmd.prp1 = sq_iova;
-	cmd.cdw10 = ((uint32_t)(depth - 1) << 16) | qid;
-	cmd.cdw11 = ((uint32_t)qid << 16) | 0x1; /* CQID | physically contiguous */
+	nvme_command_create_io_sq(&cmd, qid, depth, sq_iova);
 	err = nvme_admin_sync_dmamem(ctrlr, &cmd, 3, &cpl);
 	if (err) {
-		struct nvme_command drop = {0};
+		struct nvme_command drop;
 		struct nvme_completion drop_cpl = {0};
 
 		UPCIE_DEBUG("FAILED: CREATE_IO_SQ(qid=%u); err(%d)", qid, err);
-		drop.opc = 0x4; /* Delete I/O Completion Queue */
-		drop.cdw10 = qid;
+		nvme_command_delete_io_cq(&drop, qid);
 		(void)nvme_admin_sync_dmamem(ctrlr, &drop, 4, &drop_cpl);
 		goto rollback_qpair;
 	}
@@ -274,17 +265,14 @@ nvme_controller_delete_io_qpair_dmamem(struct nvme_controller *ctrlr, struct nvm
 	int first_err = 0;
 	int err;
 
-	cmd.opc = 0x0; /* Delete I/O Submission Queue */
-	cmd.cdw10 = qid;
+	nvme_command_delete_io_sq(&cmd, qid);
 	err = nvme_admin_sync_dmamem(ctrlr, &cmd, 5, &cpl);
 	if (err && !first_err) {
 		first_err = err;
 	}
 
-	memset(&cmd, 0, sizeof(cmd));
 	memset(&cpl, 0, sizeof(cpl));
-	cmd.opc = 0x4; /* Delete I/O Completion Queue */
-	cmd.cdw10 = qid;
+	nvme_command_delete_io_cq(&cmd, qid);
 	err = nvme_admin_sync_dmamem(ctrlr, &cmd, 6, &cpl);
 	if (err && !first_err) {
 		first_err = err;

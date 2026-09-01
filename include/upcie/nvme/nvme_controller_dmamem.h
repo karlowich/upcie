@@ -14,8 +14,7 @@
  *
  * What varies between those three -- the device fd, the DMA mapping, the
  * BAR0 acquisition -- stays with each of them. What is shared lives here:
- * SQ/CQ allocation and release, the synchronous admin helper the dmamem
- * admin queue needs, and I/O queue-pair creation and deletion.
+ * SQ/CQ allocation and release, and I/O queue-pair creation and deletion.
  *
  * The submit/reap path itself is the heap-agnostic nvme_qpair primitives
  * (nvme_qpair_enqueue, nvme_qpair_sqdb_update, nvme_qpair_reap_cpl); only
@@ -147,38 +146,6 @@ nvme_qpair_dmamem_term(struct nvme_qpair *qp, struct dmamem_heap *heap, size_t s
 }
 
 /**
- * Synchronous admin-command helper for the dmamem admin queue.
- *
- * The dmamem admin queue does not carry a request pool, so submit_sync
- * cannot be used. This helper does a manual enqueue + doorbell + reap
- * with a caller-supplied CID.
- */
-static inline int
-nvme_admin_sync_dmamem(struct nvme_controller *ctrlr, struct nvme_command *cmd, uint16_t cid,
-		       struct nvme_completion *cpl)
-{
-	int err;
-
-	cmd->cid = cid;
-
-	err = nvme_qpair_enqueue(&ctrlr->aq, cmd);
-	if (err) {
-		return err;
-	}
-	nvme_qpair_sqdb_update(&ctrlr->aq);
-
-	err = nvme_qpair_reap_cpl(&ctrlr->aq, ctrlr->timeout_ms, cpl);
-	if (err) {
-		return err;
-	}
-	if ((cpl->status >> 1) & 0x7FF) {
-		UPCIE_DEBUG("FAILED: admin CQE status=0x%x", cpl->status);
-		return -EIO;
-	}
-	return 0;
-}
-
-/**
  * Create an I/O queue pair on the dmamem path.
  *
  * Allocates SQ/CQ from the caller's dmamem_heap, then programs the
@@ -224,7 +191,7 @@ nvme_controller_create_io_qpair_dmamem(struct nvme_controller *ctrlr, struct nvm
 	}
 
 	nvme_command_create_io_cq(&cmd, qid, depth, cq_iova);
-	err = nvme_admin_sync_dmamem(ctrlr, &cmd, 2, &cpl);
+	err = nvme_qpair_submit_sync(&ctrlr->aq, &cmd, ctrlr->timeout_ms, &cpl);
 	if (err) {
 		UPCIE_DEBUG("FAILED: CREATE_IO_CQ(qid=%u); err(%d)", qid, err);
 		goto rollback_qpair;
@@ -232,14 +199,14 @@ nvme_controller_create_io_qpair_dmamem(struct nvme_controller *ctrlr, struct nvm
 
 	memset(&cpl, 0, sizeof(cpl));
 	nvme_command_create_io_sq(&cmd, qid, depth, sq_iova);
-	err = nvme_admin_sync_dmamem(ctrlr, &cmd, 3, &cpl);
+	err = nvme_qpair_submit_sync(&ctrlr->aq, &cmd, ctrlr->timeout_ms, &cpl);
 	if (err) {
 		struct nvme_command drop;
 		struct nvme_completion drop_cpl = {0};
 
 		UPCIE_DEBUG("FAILED: CREATE_IO_SQ(qid=%u); err(%d)", qid, err);
 		nvme_command_delete_io_cq(&drop, qid);
-		(void)nvme_admin_sync_dmamem(ctrlr, &drop, 4, &drop_cpl);
+		(void)nvme_qpair_submit_sync(&ctrlr->aq, &drop, ctrlr->timeout_ms, &drop_cpl);
 		goto rollback_qpair;
 	}
 
@@ -266,14 +233,14 @@ nvme_controller_delete_io_qpair_dmamem(struct nvme_controller *ctrlr, struct nvm
 	int err;
 
 	nvme_command_delete_io_sq(&cmd, qid);
-	err = nvme_admin_sync_dmamem(ctrlr, &cmd, 5, &cpl);
+	err = nvme_qpair_submit_sync(&ctrlr->aq, &cmd, ctrlr->timeout_ms, &cpl);
 	if (err && !first_err) {
 		first_err = err;
 	}
 
 	memset(&cpl, 0, sizeof(cpl));
 	nvme_command_delete_io_cq(&cmd, qid);
-	err = nvme_admin_sync_dmamem(ctrlr, &cmd, 6, &cpl);
+	err = nvme_qpair_submit_sync(&ctrlr->aq, &cmd, ctrlr->timeout_ms, &cpl);
 	if (err && !first_err) {
 		first_err = err;
 	}
